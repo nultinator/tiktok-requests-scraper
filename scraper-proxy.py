@@ -22,6 +22,7 @@ def get_scrapeops_url(url, location="us"):
         "url": url,
         "country": location,
         "residential": True,
+        "wait": 2000
         }
     proxy_url = "https://proxy.scrapeops.io/v1/?" + urlencode(payload)
     return proxy_url
@@ -42,6 +43,27 @@ class ProfileData:
     nickname: str = ""
     verified: bool  = False
     signature: str = ""
+
+    def __post_init__(self):
+        self.check_string_fields()
+        
+    def check_string_fields(self):
+        for field in fields(self):
+            # Check string fields
+            if isinstance(getattr(self, field.name), str):
+                # If empty set default text
+                if getattr(self, field.name) == "":
+                    setattr(self, field.name, f"No {field.name}")
+                    continue
+                # Strip any trailing spaces, etc.
+                value = getattr(self, field.name)
+                setattr(self, field.name, value.strip())
+
+@dataclass
+class VideoData:
+    name: str = ""
+    url: str = ""
+    views: str = ""
 
     def __post_init__(self):
         self.check_string_fields()
@@ -116,7 +138,7 @@ def scrape_channel(channel_name, location, data_pipeline=None, retries=3):
     while tries <= retries and not success:
         try:
             scrapeops_proxy_url = get_scrapeops_url(url, location=location)
-            print(scrapeops_proxy_url)
+            
             response = requests.get(scrapeops_proxy_url)
             logger.info(f"Recieved [{response.status_code}] from: {url}")
             if response.status_code == 200:
@@ -176,6 +198,70 @@ def start_scrape(channel_list, location, data_pipeline=None, max_threads=5, retr
             [retries] * len(channel_list)
         )
 
+def scrape_channel_content(row, location, retries):
+    url = f"https://www.tiktok.com/@{row['name']}"
+    tries = 0
+    success = False
+    
+    while tries <= retries and not success:
+        try:
+            scrapeops_proxy_url = get_scrapeops_url(url, location=location)
+            response = requests.get(scrapeops_proxy_url)
+            logger.info(f"Recieved [{response.status_code}] from: {url}")
+            if response.status_code == 200:
+                success = True
+            
+            else:
+                raise Exception(f"Failed request, Status Code {response.status_code}")
+                
+                ## Extract Data
+
+            video_pipeline = DataPipeline(csv_filename=f"{row['name']}.csv")
+            soup = BeautifulSoup(response.text, "html.parser")
+
+            main_content = soup.select_one("div[id='main-content-others_homepage']")           
+            links = main_content.find_all("a")
+
+            for link in links:
+                href = link.get("href")
+                if row["name"] not in href:
+                    continue
+                views = 0
+                views_present = link.select_one("strong[data-e2e='video-views']")
+                if views_present:
+                    views = views_present.text
+
+                video_data = VideoData(
+                    name=href.split("/")[-1],
+                    url=href,
+                    views=views
+                )
+
+                video_pipeline.add_data(video_data)
+            success = True
+            video_pipeline.close_pipeline()
+
+                    
+        except Exception as e:
+            logger.error(f"An error occurred while processing page {url}: {e}")
+            logger.info(f"Retrying request for page: {url}, retries left {retries-tries}")
+            tries+=1
+    if not success:
+        raise Exception(f"Max Retries exceeded: {retries}")
+
+def process_results(csv_file, location, max_threads=5, retries=3):
+    logger.info(f"processing {csv_file}")
+    with open(csv_file, newline="") as file:
+        reader = list(csv.DictReader(file))
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_threads) as executor:
+            executor.map(
+                scrape_channel_content,
+                reader,
+                [location] * len(reader),
+                [retries] * len(reader)
+            )
+
 
 if __name__ == "__main__":
 
@@ -183,7 +269,7 @@ if __name__ == "__main__":
     MAX_THREADS = 5
     LOCATION = "uk"
 
-    logger.info(f"Scrape starting...")
+    logger.info(f"Crawl starting...")
 
     ## INPUT ---> List of keywords to scrape
     channel_list = [
@@ -203,4 +289,10 @@ if __name__ == "__main__":
     crawl_pipeline = DataPipeline(csv_filename="channels.csv")
     start_scrape(channel_list, LOCATION, data_pipeline=crawl_pipeline, max_threads=MAX_THREADS, retries=MAX_RETRIES)
     crawl_pipeline.close_pipeline()
-    logger.info(f"Scrape complete.")
+    logger.info(f"Crawl complete.")
+
+    logger.info("Starting content scrape...")
+
+    process_results("channels.csv", LOCATION, max_threads=MAX_THREADS, retries=MAX_RETRIES)
+    logger.info("Content scrape complete")
+
